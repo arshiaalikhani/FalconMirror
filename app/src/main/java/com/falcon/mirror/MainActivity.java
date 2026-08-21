@@ -7,6 +7,7 @@ import android.graphics.Canvas;
 import android.graphics.Rect;
 import android.net.Uri;
 import android.os.Bundle;
+import android.util.Log;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.WindowManager;
@@ -17,12 +18,12 @@ import java.net.Socket;
 
 public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
+    private static final String TAG = "FalconMirror";
     private SurfaceView surfaceView;
     private SurfaceHolder surfaceHolder;
     private Thread streamThread;
     private volatile boolean running = false;
 
-    // آدرس پیش‌فرض (اگه لینک نزدن)
     private String host = "192.168.1.2";
     private int port = 5000;
 
@@ -30,7 +31,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
-        // تمام‌صفحه + صفحه روشن بمونه
         getWindow().addFlags(
             WindowManager.LayoutParams.FLAG_FULLSCREEN |
             WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
@@ -42,7 +42,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         surfaceHolder = surfaceView.getHolder();
         surfaceHolder.addCallback(this);
 
-        // پارس دیپ لینک: falcon://192.168.1.2:5000
         Uri uri = getIntent().getData();
         if (uri != null) {
             String h = uri.getHost();
@@ -52,15 +51,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         }
     }
 
-    // ============================================================
-    //  SurfaceHolder Callbacks
-    // ============================================================
-
     @Override
     public void surfaceCreated(SurfaceHolder holder) {
         running = true;
         streamThread = new Thread(this::streamLoop, "FalconStreamThread");
         streamThread.start();
+        Log.d(TAG, "Stream thread started");
     }
 
     @Override
@@ -69,57 +65,99 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     @Override
     public void surfaceDestroyed(SurfaceHolder holder) {
         running = false;
-        try {
-            if (streamThread != null) streamThread.join(2000);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
+        if (streamThread != null) {
+            try {
+                streamThread.join(2000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
         }
+        Log.d(TAG, "Stream thread stopped");
     }
 
-    // ============================================================
-    //  حلقه اصلی استریم
-    // ============================================================
-
     private void streamLoop() {
+        Log.d(TAG, "Connecting to " + host + ":" + port);
+
         while (running) {
-            try (Socket socket = new Socket(host, port);
-                 DataInputStream in = new DataInputStream(socket.getInputStream())) {
+            Socket socket = null;
+            DataInputStream in = null;
+
+            try {
+                socket = new Socket(host, port);
+                socket.setSoTimeout(5000); // 5 ثانیه تایم‌اوت برای خواندن
+                in = new DataInputStream(socket.getInputStream());
+
+                Log.d(TAG, "Connected to server!");
 
                 while (running) {
-                    // 1. خوندن سایز فریم (4 بایت، big-endian)
-                    int frameSize = in.readInt();
+                    try {
+                        // 1. خواندن سایز
+                        int frameSize = in.readInt();
+                        Log.d(TAG, "Received frame size: " + frameSize);
 
-                    // بررسی سانیتی
-                    if (frameSize <= 0 || frameSize > 15 * 1024 * 1024) continue;
+                        if (frameSize <= 0 || frameSize > 15 * 1024 * 1024) {
+                            Log.w(TAG, "Invalid frame size: " + frameSize);
+                            continue;
+                        }
 
-                    // 2. خوندن داده JPEG
-                    byte[] frameData = new byte[frameSize];
-                    in.readFully(frameData);
+                        // 2. خواندن داده JPEG
+                        byte[] frameData = new byte[frameSize];
+                        in.readFully(frameData);
+                        Log.d(TAG, "Frame data received: " + frameData.length + " bytes");
 
-                    // 3. دیکود JPEG به Bitmap
-                    Bitmap bitmap = BitmapFactory.decodeByteArray(frameData, 0, frameSize);
-                    if (bitmap == null) continue;
+                        // 3. تبدیل به Bitmap
+                        Bitmap bitmap = BitmapFactory.decodeByteArray(frameData, 0, frameSize);
+                        if (bitmap == null) {
+                            Log.e(TAG, "Failed to decode JPEG");
+                            continue;
+                        }
 
-                    // 4. رسم روی SurfaceView (کشیده میشه به اندازه صفحه)
-                    Canvas canvas = surfaceHolder.lockCanvas();
-                    if (canvas != null) {
-                        Rect dst = new Rect(0, 0, canvas.getWidth(), canvas.getHeight());
-                        canvas.drawBitmap(bitmap, null, dst, null);
-                        surfaceHolder.unlockCanvasAndPost(canvas);
+                        // 4. نمایش روی SurfaceView
+                        Canvas canvas = surfaceHolder.lockCanvas();
+                        if (canvas != null) {
+                            Rect dst = new Rect(0, 0, canvas.getWidth(), canvas.getHeight());
+                            canvas.drawBitmap(bitmap, null, dst, null);
+                            surfaceHolder.unlockCanvasAndPost(canvas);
+                        } else {
+                            Log.w(TAG, "Canvas is null");
+                        }
+
+                        bitmap.recycle();
+
+                    } catch (IOException e) {
+                        Log.e(TAG, "IO error while reading frame: " + e.getMessage());
+                        // اگر خطای خواندن رخ داد، از حلقه داخلی خارج می‌شیم تا دوباره وصل بشیم
+                        break;
+                    } catch (Exception e) {
+                        Log.e(TAG, "Unexpected error: " + e.getMessage(), e);
+                        break;
                     }
-                    bitmap.recycle();
                 }
 
             } catch (IOException e) {
-                // اتصال قطع شد، 2 ثانیه صبر کن دوباره امتحان کن
+                Log.e(TAG, "Connection error: " + e.getMessage());
+            } finally {
+                // بستن منابع
+                try {
+                    if (in != null) in.close();
+                } catch (IOException e) { /* ignore */ }
+                try {
+                    if (socket != null) socket.close();
+                } catch (IOException e) { /* ignore */ }
+            }
+
+            // قبل از تلاش مجدد، ۲ ثانیه صبر کن
+            if (running) {
                 try {
                     Thread.sleep(2000);
-                } catch (InterruptedException ie) {
+                } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     break;
                 }
             }
         }
+
+        Log.d(TAG, "Stream loop ended");
     }
 
     @Override
